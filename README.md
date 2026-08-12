@@ -35,13 +35,14 @@ source .venv/bin/activate
 ### 3. Dependencies
 
 ```bash
-pip install --upgrade pip && pip install mujoco robot_descriptions imageio imageio-ffmpeg
+pip install --upgrade pip && pip install mujoco robot_descriptions viser imageio imageio-ffmpeg
 ```
 
 | Package | Why |
 | --- | --- |
 | `mujoco` | The engine plus its Python bindings, viewer and renderer |
 | `robot_descriptions` | Downloads and caches robot models (MuJoCo Menagerie, URDFs) |
+| `viser` | Optional — view the simulation in a browser instead of a native window |
 | `imageio` + `imageio-ffmpeg` | Optional — only needed to write mp4 files |
 
 `glfw`, `PyOpenGL` and `numpy` arrive automatically as `mujoco` dependencies.
@@ -68,12 +69,19 @@ training, offscreen mp4 rendering. Only the live GUI needs `mjpython`. Getting
 this wrong produces `launch_passive requires that the Python script is run under
 mjpython on macOS`.
 
+Or sidestep it entirely with `--viser`, which renders in a browser and works
+under plain `python` — see [Browser viewing](#browser-viewing-with-viser).
+
 ---
 
 ## Running the example
 
 ```bash
 mjpython examples/g1_walk.py --mode march
+```
+
+```bash
+python examples/g1_walk.py --mode walk --viser
 ```
 
 ```bash
@@ -224,9 +232,9 @@ Control almost never wants 500 Hz. Real policies run at 20–50 Hz and hold thei
 output across many physics steps — that ratio is a genuine hyperparameter, not
 an implementation detail.
 
-### Three ways to see it
+### Four ways to see it
 
-The example implements all three, and they share the identical `step()` function
+The example implements all four, and they share the identical `step()` function
 — rendering is strictly downstream of physics.
 
 **1. Headless** — no graphics. The mode you tune, test, and train in. Measured
@@ -255,7 +263,9 @@ Two details the example handles and beginners usually miss: `sync()` every
 single physics step wastes most of your frame budget, and without an explicit
 `time.sleep` the simulation runs 25× too fast to watch.
 
-**3. Offscreen renderer** — `MjData` → `MjvScene` → pixels, for mp4 or for
+**3. Browser, via viser** — see [below](#browser-viewing-with-viser).
+
+**4. Offscreen renderer** — `MjData` → `MjvScene` → pixels, for mp4 or for
 pixel-observation RL. Needs no window, so plain `python` is fine.
 
 ```python
@@ -263,6 +273,66 @@ with mujoco.Renderer(model, height=480, width=640) as renderer:
     renderer.update_scene(data, cam)
     frame = renderer.render()      # (480, 640, 3) uint8 numpy array
 ```
+
+---
+
+## Browser viewing with viser
+
+```bash
+python examples/g1_walk.py --mode march --viser
+```
+
+Then open <http://localhost:8080>. No `mjpython`, no OpenGL window, no display
+at all — which means this is also how you watch a simulation running on a
+headless remote machine (`ssh -L 8080:localhost:8080 user@host`).
+
+[`examples/viser_bridge.py`](examples/viser_bridge.py) is the whole integration,
+and it rests on one observation: after every `mj_step`, MuJoCo has already
+resolved each geom's world pose into `data.geom_xpos` (3,) and `data.geom_xmat`
+(9, row-major 3×3). So the work splits cleanly by how often it has to happen:
+
+| | What | Cost |
+| --- | --- | --- |
+| **Once**, at startup | Upload every geom's vertices + faces | ~200k vertices for the G1 |
+| **Every frame** | Send each geom's position + quaternion | 7 floats × 35 geoms |
+
+Re-uploading meshes per frame would be hopeless; streaming poses against
+already-uploaded geometry is what makes it interactive. Measured: 0.1 s to build
+and upload the scene, and 50 pose syncs in 0.04–0.08 s.
+
+Geometry comes from `MjModel` rather than from any MuJoCo render call. Mesh geoms
+carry their vertices in `model.mesh_vert`/`mesh_face` (already scaled at compile
+time); primitives get tessellated with `trimesh`. Two conversions are easy to get
+wrong, and both are commented in the source:
+
+- MuJoCo stores **half**-lengths in `geom_size`; trimesh wants full extents.
+- `trimesh` builds capsules from `z=0` upward while MuJoCo centres them on the
+  geom origin, so they need recentring or every capsule floats high.
+
+Rotations go through `mujoco.mju_mat2Quat` to get the `wxyz` quaternion viser
+wants, and `server.scene.set_up_direction("+z")` reconciles MuJoCo's z-up
+convention with three.js's y-up default.
+
+Flags:
+
+| Flag | Effect |
+| --- | --- |
+| `--port N` | Serve on a different port (default 8080) |
+| `--collision` | Also draw the collision primitives (71 geoms instead of 35) |
+| `--loop` | Restart the run when it ends — handy for watching `walk` fall repeatedly |
+| `--follow` | Keep the camera centred on the robot |
+
+### Two things worth knowing
+
+**Batch each frame in `server.atomic()`.** Without it every geom is sent as its
+own websocket message and the robot visibly tears apart mid-update, limbs
+lagging the torso by a frame.
+
+**Don't drive the camera at frame rate.** `--follow` is off by default, and
+throttled to 4 Hz when on. Writing `client.camera.look_at` every frame fights
+the browser's own orbit controls — it makes the view impossible to drag and can
+wedge the renderer outright. This was a real bug during development, not a
+hypothetical.
 
 ### Where the controller sits
 
@@ -337,3 +407,4 @@ of that gap concrete rather than to hide it.
 - [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) — tuned models
 - [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) — RL environments
 - [`robot_descriptions.py`](https://github.com/robot-descriptions/robot_descriptions.py) — model loader
+- [viser](https://github.com/nerfstudio-project/viser) — the browser 3D viewer

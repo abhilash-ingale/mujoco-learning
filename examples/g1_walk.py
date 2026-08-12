@@ -7,10 +7,10 @@
                                     |
                 controller --> d.ctrl --> mj_step() --> next MjData
                                     |
-                    +---------------+---------------+
-                    v               v               v
-             mujoco.viewer    mujoco.Renderer   nothing (headless)
-             interactive       offscreen mp4    fastest, for tuning/RL
+            +-------------+-------------+-------------+
+            v             v             v             v
+     mujoco.viewer   viser_bridge  mujoco.Renderer  nothing
+     native window   browser/web    offscreen mp4   headless, fastest
 
 Three controllers, in increasing order of ambition. All three are hand-written;
 the numbers come from a random search over ~4000 simulated rollouts.
@@ -33,6 +33,7 @@ a learned policy, and `walk` is here to show you the wall you hit without one.
 
 Run:
     mjpython examples/g1_walk.py --mode march        # viewer (macOS needs mjpython)
+    python   examples/g1_walk.py --mode walk --viser  # browser at localhost:8080
     python   examples/g1_walk.py --mode walk --headless
     python   examples/g1_walk.py --mode stand --headless --duration 60
     python   examples/g1_walk.py --mode walk --video walk.mp4
@@ -189,6 +190,14 @@ def main() -> None:
     ap.add_argument("--duration", type=float, default=20.0, help="sim seconds")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--video", help="write an mp4 (needs imageio + imageio-ffmpeg)")
+    ap.add_argument("--viser", action="store_true", help="stream to a browser")
+    ap.add_argument("--port", type=int, default=8080, help="viser port")
+    ap.add_argument("--collision", action="store_true",
+                    help="with --viser, also draw collision geoms")
+    ap.add_argument("--loop", action="store_true",
+                    help="with --viser, restart when the run ends")
+    ap.add_argument("--follow", action="store_true",
+                    help="with --viser, keep the camera centred on the robot")
     args = ap.parse_args()
 
     g = GAITS[args.mode]
@@ -209,6 +218,12 @@ def main() -> None:
 
     fell_at: float | None = None
 
+    def reset() -> None:
+        nonlocal fell_at
+        mujoco.mj_resetDataKeyframe(model, data, 0)
+        data.ctrl[:] = base
+        fell_at = None
+
     def step() -> None:
         """One physics step. Write ctrl, call mj_step. That is the whole API."""
         nonlocal fell_at
@@ -219,7 +234,9 @@ def main() -> None:
             fell_at = data.time
             print(f"  !! fell at t={fell_at:.2f}s after {data.qpos[0]:+.2f} m")
 
-    if args.video:
+    if args.viser:
+        run_viser(model, data, step, reset, args)
+    elif args.video:
         run_video(model, data, step, args)
     elif args.headless:
         run_headless(model, data, step, args)
@@ -258,6 +275,35 @@ def run_viewer(model, data, step, args) -> None:
             lag = n * model.opt.timestep - (time.perf_counter() - tick)
             if lag > 0:
                 time.sleep(lag)  # run at wall-clock speed, not flat out
+
+
+def run_viser(model, data, step, reset, args) -> None:
+    """Stream to a browser. Works headless and over SSH, unlike mujoco.viewer.
+
+    Structurally identical to run_viewer: step physics n times, push one frame,
+    sleep to hold wall-clock pace. Only the sink differs.
+    """
+    from viser_bridge import ViserBridge
+
+    bridge = ViserBridge(model, data, port=args.port,
+                         show_collision=args.collision, follow=args.follow)
+    print("viser: waiting for a browser to connect...")
+    if not bridge.wait_for_client():
+        print("viser: nobody connected, running anyway")
+
+    n = 10  # physics steps per pushed frame -> ~50 Hz over the websocket
+    while True:
+        tick = time.perf_counter()
+        for _ in range(n):
+            step()
+        bridge.sync()
+        lag = n * model.opt.timestep - (time.perf_counter() - tick)
+        if lag > 0:
+            time.sleep(lag)
+        if data.time >= args.duration:
+            if not args.loop:
+                break
+            reset()
 
 
 def run_video(model, data, step, args) -> None:
